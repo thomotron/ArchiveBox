@@ -11,6 +11,7 @@ from functools import wraps
 from hashlib import sha256
 from urllib.parse import urlparse, quote, unquote
 from html import escape, unescape
+from http import cookiejar
 from datetime import datetime, timezone
 from dateparser import parse as dateparser
 from requests.exceptions import RequestException, ReadTimeout
@@ -162,11 +163,19 @@ def parse_date(date: Any) -> Optional[datetime]:
 @enforce_types
 def download_url(url: str, timeout: int=None) -> str:
     """Download the contents of a remote url and return the text"""
-    from .config import TIMEOUT, CHECK_SSL_VALIDITY, WGET_USER_AGENT
+    from .config import TIMEOUT, CHECK_SSL_VALIDITY, WGET_USER_AGENT, COOKIES_FILE
     timeout = timeout or TIMEOUT
+
+    try:
+        cookies = cookiejar.MozillaCookieJar(COOKIES_FILE)
+        cookies.load()
+    except:
+        cookies = None
+
     response = requests.get(
         url,
         headers={'User-Agent': WGET_USER_AGENT},
+        cookies=cookies,
         verify=CHECK_SSL_VALIDITY,
         timeout=timeout,
     )
