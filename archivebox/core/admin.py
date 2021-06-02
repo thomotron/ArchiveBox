@@ -1,7 +1,9 @@
 __package__ = 'archivebox.core'
 
 from io import StringIO
+from pathlib import Path
 from contextlib import redirect_stdout
+from datetime import datetime, timezone
 
 from django.contrib import admin
 from django.urls import path
@@ -13,15 +15,15 @@ from django import forms
 
 from ..util import htmldecode, urldecode, ansi_to_html
 
-from core.models import Snapshot, Tag
-from core.forms import AddLinkForm, TagField
+from core.models import Snapshot, ArchiveResult, Tag
+from core.forms import AddLinkForm
 
 from core.mixins import SearchResultsAdminMixin
 
 from index.html import snapshot_icons
 from logging_util import printable_filesize
 from main import add, remove
-from config import OUTPUT_DIR
+from config import OUTPUT_DIR, SNAPSHOTS_PER_PAGE
 from extractors import archive_links
 
 # Admin URLs
@@ -36,95 +38,126 @@ from extractors import archive_links
 
 # TODO: https://stackoverflow.com/questions/40760880/add-custom-button-to-django-admin-panel
 
-def update_snapshots(modeladmin, request, queryset):
-    archive_links([
-        snapshot.as_link()
-        for snapshot in queryset
-    ], out_dir=OUTPUT_DIR)
-update_snapshots.short_description = "Archive"
 
-def update_titles(modeladmin, request, queryset):
-    archive_links([
-        snapshot.as_link()
-        for snapshot in queryset
-    ], overwrite=True, methods=('title','favicon'), out_dir=OUTPUT_DIR)
-update_titles.short_description = "Pull title"
+class ArchiveResultInline(admin.TabularInline):
+    model = ArchiveResult
 
-def overwrite_snapshots(modeladmin, request, queryset):
-    archive_links([
-        snapshot.as_link()
-        for snapshot in queryset
-    ], overwrite=True, out_dir=OUTPUT_DIR)
-overwrite_snapshots.short_description = "Re-archive (overwrite)"
+class TagInline(admin.TabularInline):
+    model = Snapshot.tags.through
 
-def verify_snapshots(modeladmin, request, queryset):
-    for snapshot in queryset:
-        print(snapshot.timestamp, snapshot.url, snapshot.is_archived, snapshot.archive_size, len(snapshot.history))
+from django.contrib.admin.helpers import ActionForm
+from django.contrib.admin.widgets import AutocompleteSelectMultiple
 
-verify_snapshots.short_description = "Check"
+class AutocompleteTags:
+    model = Tag
+    search_fields = ['name']
 
-def delete_snapshots(modeladmin, request, queryset):
-    remove(snapshots=queryset, yes=True, delete=True, out_dir=OUTPUT_DIR)
-
-delete_snapshots.short_description = "Delete"
+class AutocompleteTagsAdminStub:
+    name = 'admin'
 
 
-class SnapshotAdminForm(forms.ModelForm):
-    tags = TagField(required=False)
+class SnapshotActionForm(ActionForm):
+    tags = forms.ModelMultipleChoiceField(
+        queryset=Tag.objects.all(),
+        required=False,
+        widget=AutocompleteSelectMultiple(
+            AutocompleteTags(),
+            AutocompleteTagsAdminStub(),
+        ),
+    )
 
-    class Meta:
-        model = Snapshot
-        fields = "__all__"
-
-    def save(self, commit=True):
-        # Based on: https://stackoverflow.com/a/49933068/3509554
-
-        # Get the unsave instance
-        instance = forms.ModelForm.save(self, False)
-        tags = self.cleaned_data.pop("tags")
-
-        #update save_m2m
-        def new_save_m2m():
-            instance.save_tags(tags)
-
-        # Do we need to save all changes now?
-        self.save_m2m = new_save_m2m
-        if commit:
-            instance.save()
-
-        return instance
+    # TODO: allow selecting actions for specific extractors? is this useful?
+    # EXTRACTOR_CHOICES = [
+    #     (name, name.title())
+    #     for name, _, _ in get_default_archive_methods()
+    # ]
+    # extractor = forms.ChoiceField(
+    #     choices=EXTRACTOR_CHOICES,
+    #     required=False,
+    #     widget=forms.MultileChoiceField(attrs={'class': "form-control"})
+    # )
 
 
 class SnapshotAdmin(SearchResultsAdminMixin, admin.ModelAdmin):
-    list_display = ('added', 'title_str', 'url_str', 'files', 'size')
-    sort_fields = ('title_str', 'url_str', 'added')
-    readonly_fields = ('id', 'url', 'timestamp', 'num_outputs', 'is_archived', 'url_hash', 'added', 'updated')
-    search_fields = ['url__icontains', 'timestamp', 'title', 'tags__name']
-    fields = (*readonly_fields, 'title', 'tags')
-    list_filter = ('added', 'updated', 'tags')
+    list_display = ('added', 'title_str', 'files', 'size', 'url_str')
+    sort_fields = ('title_str', 'url_str', 'added', 'files')
+    readonly_fields = ('info', 'bookmarked', 'added', 'updated')
+    search_fields = ('id', 'url', 'timestamp', 'title', 'tags__name')
+    fields = ('timestamp', 'url', 'title', 'tags', *readonly_fields)
+    list_filter = ('added', 'updated', 'tags', 'archiveresult__status')
     ordering = ['-added']
-    actions = [delete_snapshots, overwrite_snapshots, update_snapshots, update_titles, verify_snapshots]
-    actions_template = 'admin/actions_as_select.html'
-    form = SnapshotAdminForm
-    list_per_page = 40
+    actions = ['add_tags', 'remove_tags', 'update_titles', 'update_snapshots', 'resnapshot_snapshot', 'overwrite_snapshots', 'delete_snapshots']
+    autocomplete_fields = ['tags']
+    inlines = [ArchiveResultInline]
+    list_per_page = SNAPSHOTS_PER_PAGE
+
+    action_form = SnapshotActionForm
 
     def get_urls(self):
         urls = super().get_urls()
         custom_urls = [
-            path('grid/', self.admin_site.admin_view(self.grid_view),name='grid')
+            path('grid/', self.admin_site.admin_view(self.grid_view), name='grid')
         ]
         return custom_urls + urls
 
     def get_queryset(self, request):
+        self.request = request
         return super().get_queryset(request).prefetch_related('tags')
 
     def tag_list(self, obj):
         return ', '.join(obj.tags.values_list('name', flat=True))
 
-    def id_str(self, obj):
+    # TODO: figure out a different way to do this, you cant nest forms so this doenst work
+    # def action(self, obj):
+    #     # csrfmiddlewaretoken: Wa8UcQ4fD3FJibzxqHN3IYrrjLo4VguWynmbzzcPYoebfVUnDovon7GEMYFRgsh0
+    #     # action: update_snapshots
+    #     # select_across: 0
+    #     # _selected_action: 76d29b26-2a88-439e-877c-a7cca1b72bb3
+    #     return format_html(
+    #         '''
+    #             <form action="/admin/core/snapshot/" method="post" onsubmit="e => e.stopPropagation()">
+    #                 <input type="hidden" name="csrfmiddlewaretoken" value="{}">
+    #                 <input type="hidden" name="_selected_action" value="{}">
+    #                 <button name="update_snapshots">Check</button>
+    #                 <button name="update_titles">Pull title + favicon</button>
+    #                 <button name="update_snapshots">Update</button>
+    #                 <button name="overwrite_snapshots">Re-Archive (overwrite)</button>
+    #                 <button name="delete_snapshots">Permanently delete</button>
+    #             </form>
+    #         ''',
+    #         csrf.get_token(self.request),
+    #         obj.id,
+    #     )
+
+    def info(self, obj):
         return format_html(
-            '<code style="font-size: 10px">{}</code>',
-            obj.url_hash[:8],
+            '''
+            UUID: <code style="font-size: 10px; user-select: all">{}</code> &nbsp; &nbsp;
+            Timestamp: <code style="font-size: 10px; user-select: all">{}</code> &nbsp; &nbsp;
+            URL Hash: <code style="font-size: 10px; user-select: all">{}</code><br/>
+            Archived: {} ({} files {}) &nbsp; &nbsp;
+            Favicon: <img src="{}" style="height: 20px"/> &nbsp; &nbsp;
+            Status code: {} &nbsp; &nbsp;
+            Server: {} &nbsp; &nbsp;
+            Content type: {} &nbsp; &nbsp;
+            Extension: {} &nbsp; &nbsp;
+            <br/><br/>
+            <a href="/archive/{}">View Snapshot index ➡️</a> &nbsp; &nbsp;
+            <a href="/admin/core/snapshot/?id__exact={}">View actions ⚙️</a>
+            ''',
+            obj.id,
+            obj.timestamp,
+            obj.url_hash,
+            '✅' if obj.is_archived else '❌',
+            obj.num_outputs,
+            self.size(obj),
+            f'/archive/{obj.timestamp}/favicon.ico',
+            obj.status_code or '?',
+            obj.headers and obj.headers.get('Server') or '?',
+            obj.headers and obj.headers.get('Content-Type') or '?',
+            obj.extension or '?',
+            obj.timestamp,
+            obj.id,
         )
 
     def title_str(self, obj):
@@ -151,8 +184,11 @@ class SnapshotAdmin(SearchResultsAdminMixin, admin.ModelAdmin):
     def files(self, obj):
         return snapshot_icons(obj)
 
+    files.admin_order_field = 'updated'
+    files.short_description = 'Files Saved'
+
     def size(self, obj):
-        archive_size = obj.archive_size
+        archive_size = (Path(obj.link_dir) / 'index.html').exists() and obj.archive_size
         if archive_size:
             size_txt = printable_filesize(archive_size)
             if archive_size > 52428800:
@@ -165,14 +201,16 @@ class SnapshotAdmin(SearchResultsAdminMixin, admin.ModelAdmin):
             size_txt,
         )
 
+    size.admin_order_field = 'archiveresult__count'
+
     def url_str(self, obj):
         return format_html(
-            '<a href="{}"><code>{}</code></a>',
+            '<a href="{}"><code style="user-select: all;">{}</code></a>',
             obj.url,
-            obj.url.split('://www.', 1)[-1].split('://', 1)[-1][:64],
+            obj.url,
         )
 
-    def grid_view(self, request):
+    def grid_view(self, request, extra_context=None):
 
         # cl = self.get_changelist_instance(request)
 
@@ -183,35 +221,153 @@ class SnapshotAdmin(SearchResultsAdminMixin, admin.ModelAdmin):
 
         # Monkey patch here plus core_tags.py
         self.change_list_template = 'private_index_grid.html'
-        self.list_per_page = 20
+        self.list_per_page = SNAPSHOTS_PER_PAGE
         self.list_max_show_all = self.list_per_page
 
         # Call monkey patched view
-        rendered_response = self.changelist_view(request)
+        rendered_response = self.changelist_view(request, extra_context=extra_context)
 
         # Restore values
-        self.change_list_template =  saved_change_list_template
+        self.change_list_template = saved_change_list_template
         self.list_per_page = saved_list_per_page
         self.list_max_show_all = saved_list_max_show_all
 
         return rendered_response
+
+    # for debugging, uncomment this to print all requests:
+    # def changelist_view(self, request, extra_context=None):
+    #     print('[*] Got request', request.method, request.POST)
+    #     return super().changelist_view(request, extra_context=None)
+
+    def update_snapshots(self, request, queryset):
+        archive_links([
+            snapshot.as_link()
+            for snapshot in queryset
+        ], out_dir=OUTPUT_DIR)
+    update_snapshots.short_description = "Pull"
+
+    def update_titles(self, request, queryset):
+        archive_links([
+            snapshot.as_link()
+            for snapshot in queryset
+        ], overwrite=True, methods=('title','favicon'), out_dir=OUTPUT_DIR)
+    update_titles.short_description = "⬇️ Title"
+
+    def resnapshot_snapshot(self, request, queryset):
+        for snapshot in queryset:
+            timestamp = datetime.now(timezone.utc).isoformat('T', 'seconds')
+            new_url = snapshot.url.split('#')[0] + f'#{timestamp}'
+            add(new_url, tag=snapshot.tags_str())
+    resnapshot_snapshot.short_description = "Re-Snapshot"
+
+    def overwrite_snapshots(self, request, queryset):
+        archive_links([
+            snapshot.as_link()
+            for snapshot in queryset
+        ], overwrite=True, out_dir=OUTPUT_DIR)
+    overwrite_snapshots.short_description = "Reset"
+
+    def delete_snapshots(self, request, queryset):
+        remove(snapshots=queryset, yes=True, delete=True, out_dir=OUTPUT_DIR)
+
+    delete_snapshots.short_description = "Delete"
+
+    def add_tags(self, request, queryset):
+        tags = request.POST.getlist('tags')
+        print('[+] Adding tags', tags, 'to Snapshots', queryset)
+        for obj in queryset:
+            obj.tags.add(*tags)
+
+    add_tags.short_description = "+"
+
+    def remove_tags(self, request, queryset):
+        tags = request.POST.getlist('tags')
+        print('[-] Removing tags', tags, 'to Snapshots', queryset)
+        for obj in queryset:
+            obj.tags.remove(*tags)
+
+    remove_tags.short_description = "–"
+
         
 
-    id_str.short_description = 'ID'
     title_str.short_description = 'Title'
     url_str.short_description = 'Original URL'
 
-    id_str.admin_order_field = 'id'
     title_str.admin_order_field = 'title'
     url_str.admin_order_field = 'url'
 
+
+
 class TagAdmin(admin.ModelAdmin):
-    list_display = ('slug', 'name', 'id')
+    list_display = ('slug', 'name', 'num_snapshots', 'snapshots', 'id')
     sort_fields = ('id', 'name', 'slug')
-    readonly_fields = ('id',)
+    readonly_fields = ('id', 'num_snapshots', 'snapshots')
     search_fields = ('id', 'name', 'slug')
     fields = (*readonly_fields, 'name', 'slug')
+    actions = ['delete_selected']
+    ordering = ['-id']
 
+    def num_snapshots(self, obj):
+        return format_html(
+            '<a href="/admin/core/snapshot/?tags__id__exact={}">{} total</a>',
+            obj.id,
+            obj.snapshot_set.count(),
+        )
+
+    def snapshots(self, obj):
+        total_count = obj.snapshot_set.count()
+        return mark_safe('<br/>'.join(
+            format_html(
+                '{} <code><a href="/admin/core/snapshot/{}/change"><b>[{}]</b></a> {}</code>',
+                snap.updated.strftime('%Y-%m-%d %H:%M') if snap.updated else 'pending...',
+                snap.id,
+                snap.timestamp,
+                snap.url,
+            )
+            for snap in obj.snapshot_set.order_by('-updated')[:10]
+        ) + (f'<br/><a href="/admin/core/snapshot/?tags__id__exact={obj.id}">and {total_count-10} more...<a>' if obj.snapshot_set.count() > 10 else ''))
+
+
+class ArchiveResultAdmin(admin.ModelAdmin):
+    list_display = ('id', 'start_ts', 'extractor', 'snapshot_str', 'tags_str', 'cmd_str', 'status', 'output_str')
+    sort_fields = ('start_ts', 'extractor', 'status')
+    readonly_fields = ('id', 'uuid', 'snapshot_str', 'tags_str')
+    search_fields = ('id', 'uuid', 'snapshot__url', 'extractor', 'output', 'cmd_version', 'cmd', 'snapshot__timestamp')
+    fields = (*readonly_fields, 'snapshot', 'extractor', 'status', 'start_ts', 'end_ts', 'output', 'pwd', 'cmd', 'cmd_version')
+    autocomplete_fields = ['snapshot']
+
+    list_filter = ('status', 'extractor', 'start_ts', 'cmd_version')
+    ordering = ['-start_ts']
+    list_per_page = SNAPSHOTS_PER_PAGE
+
+    def snapshot_str(self, obj):
+        return format_html(
+            '<a href="/archive/{}/index.html"><b><code>[{}]</code></b></a><br/>'
+            '<small>{}</small>',
+            obj.snapshot.timestamp,
+            obj.snapshot.timestamp,
+            obj.snapshot.url[:128],
+        )
+
+    def tags_str(self, obj):
+        return obj.snapshot.tags_str()
+
+    def cmd_str(self, obj):
+        return format_html(
+            '<pre>{}</pre>',
+            ' '.join(obj.cmd) if isinstance(obj.cmd, list) else str(obj.cmd),
+        )
+
+    def output_str(self, obj):
+        return format_html(
+            '<a href="/archive/{}/{}" class="output-link">↗️</a><pre>{}</pre>',
+            obj.snapshot.timestamp,
+            obj.output if (obj.status == 'succeeded') and obj.extractor not in ('title', 'archive_org') else 'index.html',
+            obj.output,
+        )
+
+    tags_str.short_description = 'tags'
+    snapshot_str.short_description = 'snapshot'
 
 class ArchiveBoxAdmin(admin.AdminSite):
     site_header = 'ArchiveBox'
@@ -266,4 +422,5 @@ admin.site = ArchiveBoxAdmin()
 admin.site.register(get_user_model())
 admin.site.register(Snapshot, SnapshotAdmin)
 admin.site.register(Tag, TagAdmin)
+admin.site.register(ArchiveResult, ArchiveResultAdmin)
 admin.site.disable_action('delete_selected')

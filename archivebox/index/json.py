@@ -5,7 +5,7 @@ import sys
 import json as pyjson
 from pathlib import Path
 
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import List, Optional, Iterator, Any, Union
 
 from .schema import Link
@@ -15,7 +15,6 @@ from ..config import (
     VERSION,
     OUTPUT_DIR,
     FOOTER_INFO,
-    GIT_SHA,
     DEPENDENCIES,
     JSON_INDEX_FILENAME,
     ARCHIVE_DIR_NAME,
@@ -30,7 +29,7 @@ MAIN_INDEX_HEADER = {
     'meta': {
         'project': 'ArchiveBox',
         'version': VERSION,
-        'git_sha': GIT_SHA,
+        'git_sha': VERSION,  # not used anymore, but kept for backwards compatibility
         'website': 'https://ArchiveBox.io',
         'docs': 'https://github.com/ArchiveBox/ArchiveBox/wiki',
         'source': 'https://github.com/ArchiveBox/ArchiveBox',
@@ -45,7 +44,7 @@ def generate_json_index_from_links(links: List[Link], with_headers: bool):
         output = {
             **MAIN_INDEX_HEADER,
             'num_links': len(links),
-            'updated': datetime.now(),
+            'updated': datetime.now(timezone.utc),
             'last_run_cmd': sys.argv,
             'links': links,
         }
@@ -61,7 +60,18 @@ def parse_json_main_index(out_dir: Path=OUTPUT_DIR) -> Iterator[Link]:
     index_path = Path(out_dir) / JSON_INDEX_FILENAME
     if index_path.exists():
         with open(index_path, 'r', encoding='utf-8') as f:
-            links = pyjson.load(f)['links']
+            try:
+                links = pyjson.load(f)['links']
+                if links:
+                    Link.from_json(links[0])
+            except Exception as err:
+                print("    {lightyellow}! Found an index.json in the project root but couldn't load links from it: {} {}".format(
+                    err.__class__.__name__,
+                    err,
+                    **ANSI,
+                ))
+                return ()
+
             for link_json in links:
                 try:
                     yield Link.from_json(link_json)

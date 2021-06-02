@@ -265,14 +265,14 @@ def load_main_index_meta(out_dir: Path=OUTPUT_DIR) -> Optional[dict]:
 
 
 @enforce_types
-def parse_links_from_source(source_path: str, root_url: Optional[str]=None) -> Tuple[List[Link], List[Link]]:
+def parse_links_from_source(source_path: str, root_url: Optional[str]=None, parser: str="auto") -> Tuple[List[Link], List[Link]]:
 
     from ..parsers import parse_links
 
     new_links: List[Link] = []
 
     # parse and validate the import file
-    raw_links, parser_name = parse_links(source_path, root_url=root_url)
+    raw_links, parser_name = parse_links(source_path, root_url=root_url, parser=parser)
     new_links = validate_links(raw_links)
 
     if parser_name:
@@ -356,6 +356,7 @@ LINK_FILTERS = {
     'regex': lambda pattern: Q(url__iregex=pattern),
     'domain': lambda pattern: Q(url__istartswith=f"http://{pattern}") | Q(url__istartswith=f"https://{pattern}") | Q(url__istartswith=f"ftp://{pattern}"),
     'tag': lambda pattern: Q(tags__name=pattern),
+    'timestamp': lambda pattern: Q(timestamp=pattern),
 }
 
 @enforce_types

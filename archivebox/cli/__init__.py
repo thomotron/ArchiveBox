@@ -8,18 +8,17 @@ import argparse
 from typing import Optional, Dict, List, IO, Union
 from pathlib import Path
 
-from ..config import OUTPUT_DIR
+from ..config import OUTPUT_DIR, check_data_folder, check_migrations
 
 from importlib import import_module
 
 CLI_DIR = Path(__file__).resolve().parent
 
 # these common commands will appear sorted before any others for ease-of-use
-meta_cmds = ('help', 'version')
-main_cmds = ('init', 'info', 'config')
-archive_cmds = ('add', 'remove', 'update', 'list', 'status')
-
-fake_db = ("oneshot",)
+meta_cmds = ('help', 'version')                               # dont require valid data folder at all
+main_cmds = ('init', 'config', 'setup')                       # dont require existing db present
+archive_cmds = ('add', 'remove', 'update', 'list', 'status')  # require existing db present
+fake_db = ("oneshot",)                                        # use fake in-memory db
 
 display_first = (*meta_cmds, *main_cmds, *archive_cmds)
 
@@ -61,9 +60,21 @@ def run_subcommand(subcommand: str,
                    pwd: Union[Path, str, None]=None) -> None:
     """Run a given ArchiveBox subcommand with the given list of args"""
 
+    subcommand_args = subcommand_args or []
+
     if subcommand not in meta_cmds:
         from ..config import setup_django
-        setup_django(in_memory_db=subcommand in fake_db, check_db=subcommand in archive_cmds)
+
+        cmd_requires_db = subcommand in archive_cmds
+        init_pending = '--init' in subcommand_args or '--quick-init' in subcommand_args
+
+        if cmd_requires_db:
+            check_data_folder(pwd)
+
+        setup_django(in_memory_db=subcommand in fake_db, check_db=cmd_requires_db and not init_pending)
+
+        if cmd_requires_db:
+            check_migrations()
 
     module = import_module('.archivebox_{}'.format(subcommand), __package__)
     module.main(args=subcommand_args, stdin=stdin, pwd=pwd)    # type: ignore

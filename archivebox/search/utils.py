@@ -16,7 +16,7 @@ def get_file_result_content(res, extra_path, use_pwd=False):
     if extra_path:
         fpath = f'{fpath}/{extra_path}'
 
-    with open(fpath, 'r') as file:
+    with open(fpath, 'r', encoding='utf-8') as file:
         data = file.read()
     if data:
         return [data]
@@ -36,10 +36,10 @@ def get_indexable_content(results: QuerySet):
 
     # TODO: banish this duplication and get these from the extractor file
     if method == 'readability':
-        return get_file_result_content(res, 'content.txt')
+        return get_file_result_content(res, 'content.txt', use_pwd=True)
     elif method == 'singlefile':
-        return get_file_result_content(res,'',use_pwd=True)
+        return get_file_result_content(res, '', use_pwd=True)
     elif method == 'dom':
-        return get_file_result_content(res,'',use_pwd=True)
+        return get_file_result_content(res, '', use_pwd=True)
     elif method == 'wget':
-        return get_file_result_content(res,'',use_pwd=True)
+        return get_file_result_content(res, '', use_pwd=True)
